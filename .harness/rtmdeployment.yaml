@@ -1,0 +1,1481 @@
+pipeline:
+  name: rtm-deployment
+  identifier: rtmdeployment
+  projectIdentifier: CSETest1
+  orgIdentifier: AbhiOrg
+  tags: {}
+  properties:
+    ci:
+      codebase:
+        connectorRef: org.capgroupictgithubcgictemu
+        repoName: rtm
+        build:
+          type: branch
+          spec:
+            branch: <+<+pipeline.triggerType> == "MANUAL" ? <+pipeline.branch>:<+trigger.branch>>
+        depth: 1
+  stages:
+    - stage:
+        name: Build App
+        identifier: Build
+        description: ""
+        type: CI
+        spec:
+          cloneCodebase: true
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: account.second
+              namespace: inavigateaa00002756-delegate-oz-dev
+              automountServiceAccountToken: true
+              nodeSelector: {}
+              containerSecurityContext:
+                privileged: false
+                allowPrivilegeEscalation: true
+              os: Linux
+          execution:
+            steps:
+              - step:
+                  name: Gauntlet Scan
+                  identifier: Gauntlet
+                  template:
+                    templateRef: account.cggauntletscansteptemplate
+                    versionLabel: v.04
+                    templateInputs:
+                      type: Run
+                      spec:
+                        envVariables:
+                          ENV_GATE: OZ-DEV
+                  when:
+                    stageStatus: Success
+                    condition: <+pipeline.variables.enable_gauntlet_scans>=="true"
+              - step:
+                  name: Get Version
+                  type: Run
+                  identifier: Get_Version
+                  spec:
+                    connectorRef: account.acct_cgdevregistry_aws_nexus_publish
+                    image: harness/common/helm:1.0.3
+                    shell: Bash
+                    command: |-
+                      # Generate app version and helm version
+                      version=$(cat $HELM_CHART_DIR/Chart.yaml | grep appVersion:)
+                      version=${version#*: }
+                      app_version=$(echo $version | tr -d '"')
+                      echo "[INFO] App Version from chart: ${app_version}"
+                      semver="${app_version}.${BUILD_NUMBER}-${BUILD_BRANCH}"
+                      echo "[INFO] Chart semver : ${semver}"
+                      echo "Complete"
+                    envVariables:
+                      BUILD_BRANCH: <+codebase.branch>
+                      HELM_CHART_DIR: <+pipeline.variables.helm_chart_directory>
+                      BUILD_NUMBER: <+pipeline.variables.build_number>
+                    outputVariables:
+                      - name: semver
+              - step:
+                  type: Background
+                  name: Docker Daemon
+                  identifier: dind
+                  spec:
+                    connectorRef: account.acct_cgdevregistry_aws_nexus_publish
+                    image: docker:27.4.0-dind
+                    shell: Bash
+                    privileged: true
+                    envVariables:
+                      DOCKER_BUILDKIT: "1"
+                    entrypoint:
+                      - dockerd-entrypoint.sh
+              - step:
+                  type: Run
+                  name: Build and Push
+                  identifier: Docker
+                  spec:
+                    connectorRef: account.acct_cgdevregistry_aws_nexus_publish
+                    image: docker:27.4.0-dind
+                    shell: Sh
+                    command: |-
+                      set -x
+                      sed -i 's|https://|http://|g' /etc/apk/repositories
+                      apk update
+                      apk add --no-cache ca-certificates curl jq
+
+                      # wait command
+                      while ! docker ps ;do
+                            echo "Docker not available yet"
+                            sleep 5
+                      done
+                      echo "Docker Service Ready"
+
+                      echo "Authenticate to ${REGISTRY}"
+                      echo ${DOCKER_PASSWORD} | docker login --username ${DOCKER_USERNAME} --password-stdin ${REGISTRY}
+
+                      # Check if provided manually image tag was previously build. 
+                      # This could be used to skip app build and faster testing of Helm changes.
+                      if [ -n "${MANUAL_IMAGE_TAG}" ]; then
+                        if docker manifest inspect ${REGISTRY}/${REPO}/${APP}:${MANUAL_IMAGE_TAG}; then
+                          echo "Image ${REGISTRY}/${REPO}/${APP}:${MANUAL_IMAGE_TAG} already exists. Skipping step."
+                          exit 0
+                        else
+                          echo "Image ${REGISTRY}/${REPO}/${APP}:${MANUAL_IMAGE_TAG} does not exist."
+                          exit 1
+                        fi
+                      fi
+
+                      docker build \
+                        --build-arg BUILDKIT_INLINE_CACHE=1 \
+                        --label GIT_PATH=<+codebase.repoUrl> \
+                        --label COMMIT_ID=<+codebase.commitSha> \
+                        --label GIT_BRANCH=<+codebase.sourceBranch> \
+                        --cache-from type=registry,ref=${REGISTRY}/${REPO}/${APP}:${LATEST_TAG} \
+                        -t ${REGISTRY}/${REPO}/${APP}:${TAG} \
+                        -f ${DOCKERFILE} ${CONTEXT}
+
+                      # Push image
+                      docker push ${REGISTRY}/${REPO}/${APP}:${TAG}
+                    privileged: false
+                    envVariables:
+                      TAG: <+pipeline.stages.Build.spec.execution.steps.Get_Version.output.outputVariables.semver>
+                      REPO: <+project.identifier>
+                      APP: <+pipeline.variables.app_name>
+                      MANUAL_IMAGE_TAG: <+pipeline.variables.input_docker_image_version>
+                      DOCKERFILE: helix/container/Dockerfile
+                      CONTEXT: <+pipeline.variables.docker_build_directory>
+                      REGISTRY: cgdevregistry-aws.capgroup.com
+                      DOCKER_USERNAME: <+secrets.getValue("account.acct_cgdevregistry_aws_nexus_username")>
+                      DOCKER_PASSWORD: <+secrets.getValue("account.acct_cgdevregistry_aws_nexus_password")>
+                      DOCKER_BUILDKIT: "1"
+                    resources:
+                      limits:
+                        memory: 8G
+                        cpu: "1"
+              - step:
+                  name: Collect Test Reports
+                  type: Test
+                  identifier: Test_Reports
+                  spec:
+                    connectorRef: account.acct_cgdevregistry_aws_nexus_publish
+                    image: harness/common/helm:1.0.3
+                    intelligenceMode: true
+                    reports:
+                      type: JUnit
+                      spec:
+                        paths:
+                          - /harness/rtm-supplier/target/surefire-reports/*.xml
+                          - /harness/rtm-domain/target/surefire-reports/*.xml
+                  when:
+                    stageStatus: Success
+                    condition: <+pipeline.variables.input_docker_image_version> == ""
+              - step:
+                  type: Run
+                  name: Build and Publish Helm
+                  identifier: Push_Helm_to_Nexus
+                  spec:
+                    connectorRef: account.acct_cgdevregistry_aws_nexus_publish
+                    image: harness/common/helm:1.0.3
+                    shell: Bash
+                    command: |-
+                      # Check Helm installed
+                      helm version
+
+                      # Check yq installed
+                      yq --version
+
+                      # Calculate the actual app image tag to save into Helm.
+                      export FINAL_APP_IMAGE_TAG=${TAG}
+                      if [ -n "${MANUAL_IMAGE_TAG}" ]; then
+                        export FINAL_APP_IMAGE_TAG=${MANUAL_IMAGE_TAG}
+                      fi
+
+                      echo "AMAYD FINAL_APP_IMAGE_TAG - ${FINAL_APP_IMAGE_TAG}"
+
+                      echo "[INFO] Setting repo, image, tag, environment, and sub-environment info for deployment."
+                      export repoAndImageName="cgdevregistry-aws.capgroup.com/${PROJECT_ID}/${HELM_CHART_NAME}"
+                      # All environment values yaml files need to be patched
+                      for VALUES_FILE in $(ls ${HELM_CHART_DIR}/values-*.yaml)
+                      do
+                        yq e -i '.image.tag = env(FINAL_APP_IMAGE_TAG)' ${VALUES_FILE}
+                        cat ${VALUES_FILE}
+                        helm lint ${HELM_CHART_DIR} --values=${VALUES_FILE}
+                      done
+
+                      echo "[INFO] Setting Helm Chart name and Version - Using image name ${HELM_CHART_NAME} with tag ${TAG}..."
+                      yq e -i '.name = env(HELM_CHART_NAME)' ${HELM_CHART_DIR}/Chart.yaml
+                      yq e -i '.version = env(TAG)' ${HELM_CHART_DIR}/Chart.yaml
+                      yq e -i '.appVersion = env(FINAL_APP_IMAGE_TAG)' ${HELM_CHART_DIR}/Chart.yaml
+
+                      cat ${HELM_CHART_DIR}/Chart.yaml
+
+                      export HELM_EXPERIMENTAL_OCI=1
+
+                      echo "[INFO] Packaging Helm Chart ${HELM_CHART_NAME}..."
+                      helm package ${HELM_CHART_DIR} --debug
+                      chartName=$(yq -r .name ${HELM_CHART_DIR}/Chart.yaml)
+                      echo "[INFO] ChartName:: ${chartName}"
+
+                      helm registry login --username "${NEXUS_USERNAME}" --password "${NEXUS_PASSWORD}" cgdevregistry-aws.capgroup.com
+
+                      ls -a
+
+                      helm push "${HELM_CHART_NAME}-${TAG}.tgz" oci://cgdevregistry-aws.capgroup.com/${PROJECT_ID}
+                    envVariables:
+                      TAG: <+pipeline.stages.Build.spec.execution.steps.Get_Version.output.outputVariables.semver>
+                      MANUAL_IMAGE_TAG: <+pipeline.variables.input_docker_image_version>
+                      HELM_CHART_NAME: <+pipeline.variables.app_name>-helm
+                      HELM_CHART_DIR: <+pipeline.variables.helm_chart_directory>
+                      NEXUS_USERNAME: <+secrets.getValue("account.acct_cgdevregistry_aws_nexus_username")>
+                      NEXUS_PASSWORD: <+secrets.getValue("account.acct_cgdevregistry_aws_nexus_password")>
+                      PROJECT_ID: <+project.identifier>
+          sharedPaths:
+            - /var/run
+            - /var/lib/docker
+          caching:
+            enabled: false
+            paths: []
+          buildIntelligence:
+            enabled: false
+        delegateSelectors:
+          - inavigateaa00002756-delegate-oz-dev
+    - stage:
+        name: Deploy Dev
+        identifier: Deploy_Dev
+        description: ""
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Gauntlet Scan
+                  identifier: Gauntlet
+                  template:
+                    templateRef: account.cggauntletscanstepcustomtemplate
+                    versionLabel: v.03
+                    templateInputs:
+                      type: CustomApproval
+                      spec:
+                        environmentVariables:
+                          - name: ENV_GATE
+                            type: String
+                            value: OZ-DEV
+                          - name: APP_IMAGE_NAME
+                            type: String
+                            value: <+pipeline.variables.app_name>
+                          - name: APP_VERSION
+                            type: String
+                            value: <+pipeline.stages.Build.spec.execution.steps.Get_Version.output.outputVariables.semver>
+                  when:
+                    stageStatus: Success
+                    condition: <+pipeline.variables.input_docker_image_version> == ""
+              - step:
+                  type: Container
+                  name: Promote to DEV
+                  identifier: Promote_to_DEV
+                  spec:
+                    connectorRef: account.acct_cgdevregistry_aws_nexus_publish
+                    image: harness/banzai/dockerfile_crane:1.0.6
+                    command: |
+                      # Check Crane installed
+                      crane version
+
+                      crane auth login -u "$NEXUS_USERNAME" -p "$NEXUS_PASSWORD" cgdevregistry-aws.capgroup.com
+
+                      # Assume role in target AWS Lifecycle Account
+                      echo "[INFO] Delegate starting run in..."
+                      aws sts get-caller-identity
+
+                      echo "[INFO] Run assumed lifecycle role..."
+                      export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" \
+                      $(aws sts assume-role \
+                      --role-arn arn:aws:iam::${LIFECYCLE_ID}:role/${ATM_ID}_Harness_Pipeline_Role \
+                      --role-session-name HarnessDeployRoleSession \
+                      --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]" \
+                      --output text))
+
+                      # Auth with Crane to ECR
+                      password=$(aws ecr get-login-password --region $REGION)
+                      crane auth login -u AWS -p $password $LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com
+
+                      # copy images from nexus to ecr
+                      # if the version of Helm that is to be deployed was packaged with previous version on the app then we can ignore failure of this command.
+                      crane cp cgdevregistry-aws.capgroup.com/$PROJECT_ID/$APP_NAME:${TAG} $LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com/$APP_NAME-$ENVIRONMENT$SUB_ENVIRONMENT:${TAG} || true
+                      crane cp cgdevregistry-aws.capgroup.com/$PROJECT_ID/$HELM_CHART_NAME:${TAG} $LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com/$APP_NAME-$ENVIRONMENT$SUB_ENVIRONMENT-helm:${TAG}
+                    shell: Bash
+                    infrastructure:
+                      type: KubernetesDirect
+                      spec:
+                        connectorRef: inavigateaa00002756_kubernetes_shared
+                        namespace: inavigateaa00002756-delegate-oz-dev
+                        resources:
+                          limits:
+                            cpu: "1"
+                            memory: 2G
+                        annotations: {}
+                        labels: {}
+                        containerSecurityContext:
+                          capabilities:
+                            drop: []
+                            add: []
+                        nodeSelector: {}
+                    reports:
+                      type: JUnit
+                      spec:
+                        paths: []
+                    outputVariables: []
+                    envVariables:
+                      TAG: <+pipeline.stages.Build.spec.execution.steps.Get_Version.output.outputVariables.semver>
+                      APP_NAME: <+pipeline.variables.app_name>
+                      HELM_CHART_NAME: <+pipeline.variables.app_name>-helm
+                      ATM_ID: <+pipeline.variables.atm_id>
+                      LIFECYCLE_ID: <+stage.variables.lifecycle_id>
+                      NEXUS_USERNAME: <+secrets.getValue("account.acct_cgdevregistry_aws_nexus_username")>
+                      NEXUS_PASSWORD: <+secrets.getValue("account.acct_cgdevregistry_aws_nexus_password")>
+                      PROJECT_ID: <+project.identifier>
+                      REGION: <+pipeline.variables.region>
+                      ENVIRONMENT: <+stage.variables.environment>
+                      SUB_ENVIRONMENT: <+stage.variables.sub_environment>
+                  timeout: 1d
+              - step:
+                  type: Container
+                  name: Helm Upgrade
+                  identifier: Helm
+                  spec:
+                    connectorRef: account.acct_cgdevregistry_aws_nexus_publish
+                    image: harness/common/helm:1.0.3
+                    command: |-
+                      set -x
+                      # Check kubectl installed
+                      kubectl version --short
+
+                      # Check jq installed
+                      jq --version
+
+                      # Check helm installed
+                      helm version
+
+                      # Assume role in target AWS Lifecycle Account
+                      echo "[INFO] Delegate starting run in..."
+                      aws sts get-caller-identity
+
+                      export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" \
+                      $(aws sts assume-role \
+                      --role-arn arn:aws:iam::${LIFECYCLE_ID}:role/${ATM_ID}_Harness_Pipeline_Role \
+                      --role-session-name HarnessDeployRoleSession \
+                      --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]" \
+                      --output text))
+
+                      echo "[INFO] Runing assumed lifecycle role..."
+                      aws sts get-caller-identity
+
+                      # Get cluster name from parameter store
+                      aws ssm get-parameter --region $REGION --name "/mothership/cluster_info" --query "Parameter.Value" --output text > params.json
+                      cluster_name=$(jq -r '.cluster_name' ./params.json)
+
+                      echo "[INFO] Generating Kubeconfig file..."
+                      # Retrieve kubeconfig from SSM
+                      aws ssm get-parameter --region $REGION --name "/mothership/$cluster_name/kubeconfig" --query "Parameter.Value" --output text > kubeconfig
+                      chmod 600 kubeconfig
+
+                      # Set kubeconfig filepath
+                      export KUBECONFIG="$PWD/kubeconfig"
+
+                      # Check kubectl access
+                      echo "[INFO] Do I have access to create deployments?"
+                      kubectl auth can-i create deployments --namespace=$CLUSTER_NAMESPACE --kubeconfig="./kubeconfig"
+
+                      # Assert connection to namespace
+                      kubectl get pods -n $CLUSTER_NAMESPACE
+
+                      echo "[INFO] Logging into ECR for helm pull..."
+                      aws ecr get-login-password --region $REGION | helm registry login --username AWS --password-stdin $LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com
+
+                      echo "[INFO] Pulling helm chart from ECR..."
+                      helm pull oci://$LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com/$HELM_ECR_IMAGE_NAME --version ${TAG}
+
+                      echo "[DEBUG] ls -la"
+                      ls -la
+
+                      tar -xf "$HELM_ECR_IMAGE_NAME-$TAG.tgz"
+
+                      echo "[DEBUG] ls -la"
+                      ls -la
+
+                      echo "[INFO] Showing helm values..."
+                      cat ./$HELM_CHART_NAME/$VALUES_YAML
+                      echo "--------------------------------------------------------------------------------"
+
+                      echo "[INFO] Showing generated helm template..."
+                      echo "################################################################################"
+                      echo "# Generated Helm Template"
+                      echo "################################################################################"
+                      helm template $RELEASE_NAME $HELM_CHART_NAME --values ./$HELM_CHART_NAME/$VALUES_YAML
+                      echo "--------------------------------------------------------------------------------"
+
+                      # uninstall current helm deployment
+                      echo "[INFO] Uninstalling current version of helm release $RELEASE_NAME..."
+                      helm uninstall $RELEASE_NAME -n $CLUSTER_NAMESPACE --wait --timeout 60s || true
+
+                      if [ "$HELM_FORCE_VALUES_YAML" == "" ];
+                      then
+                        echo "[INFO] Creating new helm release with values file $VALUES_YAML..."
+                        helm upgrade --install $RELEASE_NAME ${HELM_CHART_NAME} --values ./$HELM_CHART_NAME/$VALUES_YAML -n $CLUSTER_NAMESPACE
+                      else
+                        echo "[INFO] Creating new helm release with force values file $$HELM_FORCE_VALUES_YAML..."
+                        cat $APP_NAME/$HELM_FORCE_VALUES_YAML
+                        ls -la
+                        helm upgrade --install $RELEASE_NAME $HELM_CHART_NAME --values ./$HELM_CHART_NAME/$VALUES_YAML -f ./$HELM_CHART_NAME/$HELM_FORCE_VALUES_YAML -n $CLUSTER_NAMESPACE
+                      fi
+                    shell: Bash
+                    infrastructure:
+                      type: KubernetesDirect
+                      spec:
+                        connectorRef: inavigateaa00002756_kubernetes_shared
+                        namespace: inavigateaa00002756-delegate-oz-dev
+                        resources:
+                          limits:
+                            cpu: "1"
+                            memory: 1G
+                        annotations: {}
+                        labels: {}
+                        containerSecurityContext:
+                          capabilities:
+                            drop: []
+                            add: []
+                        nodeSelector: {}
+                    reports:
+                      type: JUnit
+                      spec:
+                        paths: []
+                    outputVariables: []
+                    envVariables:
+                      TAG: <+pipeline.stages.Build.spec.execution.steps.Get_Version.output.outputVariables.semver>
+                      APP_NAME: <+pipeline.variables.app_name>
+                      ATM_ID: <+pipeline.variables.atm_id>
+                      CLUSTER_NAMESPACE: <+stage.variables.cluster_namespace>
+                      ENVIRONMENT: <+stage.variables.environment>
+                      HELM_FORCE_VALUES_YAML: <+stage.variables.helm_force_values_yaml>
+                      HELM_ECR_IMAGE_NAME: <+pipeline.variables.app_name>-<+stage.variables.environment><+stage.variables.sub_environment>-helm
+                      HELM_CHART_NAME: <+pipeline.variables.app_name>-helm
+                      LIFECYCLE_ID: <+stage.variables.lifecycle_id>
+                      REGION: <+pipeline.variables.region>
+                      RELEASE_NAME: <+pipeline.variables.release_name>
+                      SUB_ENVIRONMENT: <+stage.variables.sub_environment>
+                      VALUES_YAML: values-<+stage.variables.environment><+stage.variables.sub_environment>.yaml
+                  timeout: 1d
+              - step:
+                  type: Container
+                  name: Helm Upgrade DR
+                  identifier: HelmDR
+                  when:
+                    stageStatus: Success
+                    condition: <+stage.variables.dr_enabled>=="true"
+                  spec:
+                    connectorRef: account.acct_cgdevregistry_aws_nexus_publish
+                    image: harness/common/helm:1.0.3
+                    command: |-
+                      # Check kubectl installed
+                      kubectl version --short
+
+                      # Check jq installed
+                      jq --version
+
+                      # Check helm installed
+                      helm version
+
+                      # Assume role in target AWS Lifecycle Account
+                      echo "[INFO] Delegate starting run in..."
+                      aws sts get-caller-identity
+
+                      export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" \
+                      $(aws sts assume-role \
+                      --role-arn arn:aws:iam::${LIFECYCLE_ID}:role/${ATM_ID}_Harness_Pipeline_Role \
+                      --role-session-name HarnessDeployRoleSession \
+                      --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]" \
+                      --output text))
+
+                      echo "[INFO] Running assumed lifecycle role..."
+                      aws sts get-caller-identity
+
+                      # Get cluster name from parameter store
+                      aws ssm get-parameter --region $REGION --name "/mothership/cluster_info" --query "Parameter.Value" --output text > params.json
+                      cluster_name=$(jq -r '.cluster_name' ./params.json)
+
+                      echo "[INFO] Generating Kubeconfig file..."
+                      # Retrieve kubeconfig from SSM
+                      aws ssm get-parameter --region $REGION --name "/mothership/$cluster_name/kubeconfig" --query "Parameter.Value" --output text > kubeconfig
+                      chmod 600 kubeconfig
+
+                      # Set kubeconfig filepath
+                      export KUBECONFIG="$PWD/kubeconfig"
+
+                      # Check kubectl access
+                      echo "[INFO] Do I have access to create deployments?"
+                      kubectl auth can-i create deployments --namespace=$CLUSTER_NAMESPACE --kubeconfig="./kubeconfig"
+
+                      # Assert connection to namespace
+                      kubectl get pods -n $CLUSTER_NAMESPACE
+
+                      echo "[INFO] Logging into ECR for helm pull..."
+                      aws ecr get-login-password --region $REGION | helm registry login --username AWS --password-stdin $LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com
+
+                      echo "[INFO] Pulling helm chart from ECR..."
+                      helm pull oci://$LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com/$HELM_ECR_IMAGE_NAME --version ${TAG}
+
+                      echo "[DEBUG] ls -la"
+                      ls -la
+
+                      tar -xf "$HELM_ECR_IMAGE_NAME-$TAG.tgz"
+
+                      echo "[DEBUG] ls -la"
+                      ls -la
+
+                      echo "[INFO] Showing helm values..."
+                      cat ./$HELM_CHART_NAME/$VALUES_YAML
+                      echo "--------------------------------------------------------------------------------"
+
+                      echo "[INFO] Showing generated helm template..."
+                      echo "################################################################################"
+                      echo "# Generated Helm Template"
+                      echo "################################################################################"
+                      helm template $RELEASE_NAME $HELM_CHART_NAME --values ./$HELM_CHART_NAME/$VALUES_YAML
+                      echo "--------------------------------------------------------------------------------"
+
+                      # uninstall current helm deployment
+                      echo "[INFO] Uninstalling current version of helm release $RELEASE_NAME..."
+                      helm uninstall $RELEASE_NAME -n $CLUSTER_NAMESPACE --wait --timeout 60s || true
+
+                      if [ "$HELM_FORCE_VALUES_YAML" == "" ];
+                      then
+                        echo "[INFO] Creating new helm release with values file $VALUES_YAML..."
+                        helm upgrade --install $RELEASE_NAME $HELM_CHART_NAME --values ./$HELM_CHART_NAME/$VALUES_YAML -n $CLUSTER_NAMESPACE
+                      else
+                        echo "[INFO] Creating new helm release with force values file $$HELM_FORCE_VALUES_YAML..."
+                        cat $APP_NAME/$HELM_FORCE_VALUES_YAML
+                        ls -la
+                        helm upgrade --install $RELEASE_NAME $HELM_CHART_NAME --values ./$HELM_CHART_NAME/$VALUES_YAML -f ./$HELM_CHART_NAME/$HELM_FORCE_VALUES_YAML -n $CLUSTER_NAMESPACE
+                      fi
+                    shell: Bash
+                    infrastructure:
+                      type: KubernetesDirect
+                      spec:
+                        connectorRef: inavigateaa00002756_kubernetes_shared
+                        namespace: inavigateaa00002756-delegate-oz-dev
+                        resources:
+                          limits:
+                            cpu: "1"
+                            memory: 1G
+                        annotations: {}
+                        labels: {}
+                        containerSecurityContext:
+                          capabilities:
+                            drop: []
+                            add: []
+                        nodeSelector: {}
+                    reports:
+                      type: JUnit
+                      spec:
+                        paths: []
+                    outputVariables: []
+                    envVariables:
+                      TAG: <+pipeline.stages.Build.spec.execution.steps.Get_Version.output.outputVariables.semver>
+                      APP_NAME: <+pipeline.variables.app_name>
+                      ATM_ID: <+pipeline.variables.atm_id>
+                      CLUSTER_NAMESPACE: <+stage.variables.cluster_namespace>
+                      ENVIRONMENT: <+stage.variables.environment>
+                      HELM_FORCE_VALUES_YAML: <+stage.variables.helm_force_values_yaml>
+                      HELM_ECR_IMAGE_NAME: <+pipeline.variables.app_name>-<+stage.variables.environment><+stage.variables.sub_environment>-helm
+                      HELM_CHART_NAME: <+pipeline.variables.app_name>-helm
+                      LIFECYCLE_ID: <+stage.variables.lifecycle_id>
+                      REGION: <+pipeline.variables.region_dr>
+                      RELEASE_NAME: <+pipeline.variables.release_name>
+                      SUB_ENVIRONMENT: <+stage.variables.sub_environment>
+                      VALUES_YAML: values-<+stage.variables.environment><+stage.variables.sub_environment>-dr.yaml
+                  timeout: 1d
+        tags: {}
+        variables:
+          - name: lifecycle_id
+            type: String
+            description: ""
+            required: true
+            value: <+input>.default(864899863962)
+          - name: cluster_namespace
+            type: String
+            description: ""
+            required: true
+            value: <+input>.default(aa00002756-dev-inav-dev1)
+          - name: helm_force_values_yaml
+            type: String
+            description: ""
+            required: false
+            value: <+input>.default()
+          - name: dr_enabled
+            type: String
+            description: Set to true to enable DR deployment
+            required: false
+            value: <+input>.default(true)
+          - name: environment
+            type: String
+            value: dev
+          - name: sub_environment
+            type: String
+            value: <+input>.default(1)
+        delegateSelectors:
+          - inavigateaa00002756-delegate-oz-dev
+    - stage:
+        name: Deploy SQA
+        identifier: Deploy_SQA
+        description: ""
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Non Prod Image Promotion
+                  identifier: Non_prod_promotion
+                  template:
+                    templateRef: account.Non_ProdContainerImagePromotion
+                    versionLabel: v0.1
+                    gitBranch: main
+                    templateInputs:
+                      type: Container
+                      spec:
+                        envVariables:
+                          COMMA_SEPARATED_IMAGE_NAMES_WITH_TAG: <+pipeline.variables.app_name>:<+pipeline.stages.Build.spec.execution.steps.Get_Version.output.outputVariables.semver>,<+pipeline.variables.app_name>-helm:<+pipeline.stages.Build.spec.execution.steps.Get_Version.output.outputVariables.semver>
+              - step:
+                  name: Gauntlet Scan
+                  identifier: Gauntlet
+                  template:
+                    templateRef: account.cggauntletscanstepcustomtemplate
+                    versionLabel: v.03
+                    templateInputs:
+                      type: CustomApproval
+                      spec:
+                        environmentVariables:
+                          - name: ENV_GATE
+                            type: String
+                            value: SNP-QA
+                          - name: APP_IMAGE_NAME
+                            type: String
+                            value: <+pipeline.variables.app_name>
+                          - name: APP_VERSION
+                            type: String
+                            value: <+pipeline.stages.Build.spec.execution.steps.Get_Version.output.outputVariables.semver>
+              - step:
+                  type: Container
+                  name: Promote to SQA
+                  identifier: Promote_to_SQA
+                  spec:
+                    connectorRef: account.acct_cgdevregistry_aws_nexus_publish
+                    image: harness/banzai/dockerfile_crane:1.0.6
+                    command: |
+                      # Check Crane installed
+                      crane version
+
+                      crane auth login -u "$NEXUS_USERNAME" -p "$NEXUS_PASSWORD" cgdevregistry-aws.capgroup.com
+
+                      # Assume role in target AWS Lifecycle Account
+                      echo "[INFO] Delegate starting run in..."
+                      aws sts get-caller-identity
+
+                      echo "[INFO] Run assumed lifecycle role..."
+                      export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" \
+                      $(aws sts assume-role \
+                      --role-arn arn:aws:iam::${LIFECYCLE_ID}:role/${ATM_ID}_Harness_Pipeline_Role \
+                      --role-session-name HarnessDeployRoleSession \
+                      --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]" \
+                      --output text))
+
+                      # Auth with Crane to ECR
+                      password=$(aws ecr get-login-password --region $REGION)
+                      crane auth login -u AWS -p $password $LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com
+
+                      # copy images from nexus to ecr
+                      # if the version of Helm that is to be deployed was packaged with previous version on the app then we can ignore failure of this command.
+                      crane cp cgdevregistry-aws.capgroup.com/$PROJECT_ID/$APP_NAME:${TAG} $LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com/$APP_NAME-$ENVIRONMENT$SUB_ENVIRONMENT:${TAG} || true
+                      crane cp cgdevregistry-aws.capgroup.com/$PROJECT_ID/$HELM_CHART_NAME:${TAG} $LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com/$APP_NAME-$ENVIRONMENT$SUB_ENVIRONMENT-helm:${TAG}
+                    shell: Bash
+                    infrastructure:
+                      type: KubernetesDirect
+                      spec:
+                        connectorRef: inavigateaa00002756_kubernetes_shared
+                        namespace: inavigateaa00002756-delegate-snp-qa
+                        resources:
+                          limits:
+                            cpu: "1"
+                            memory: 2G
+                        annotations: {}
+                        labels: {}
+                        containerSecurityContext:
+                          capabilities:
+                            drop: []
+                            add: []
+                        nodeSelector: {}
+                    reports:
+                      type: JUnit
+                      spec:
+                        paths: []
+                    outputVariables: []
+                    envVariables:
+                      TAG: <+pipeline.stages.Build.spec.execution.steps.Get_Version.output.outputVariables.semver>
+                      APP_NAME: <+pipeline.variables.app_name>
+                      HELM_CHART_NAME: <+pipeline.variables.app_name>-helm
+                      ATM_ID: <+pipeline.variables.atm_id>
+                      LIFECYCLE_ID: <+stage.variables.lifecycle_id>
+                      NEXUS_USERNAME: <+secrets.getValue("account.acct_cgdevregistry_aws_nexus_username")>
+                      NEXUS_PASSWORD: <+secrets.getValue("account.acct_cgdevregistry_aws_nexus_password")>
+                      PROJECT_ID: <+project.identifier>
+                      REGION: <+pipeline.variables.region>
+                      ENVIRONMENT: <+stage.variables.environment>
+                      SUB_ENVIRONMENT: <+stage.variables.sub_environment>
+                  timeout: 1d
+              - step:
+                  type: Container
+                  name: Helm Upgrade
+                  identifier: Helm
+                  spec:
+                    connectorRef: account.acct_cgdevregistry_aws_nexus_publish
+                    image: harness/common/helm:1.0.3
+                    command: |-
+                      set -x
+                      # Check kubectl installed
+                      kubectl version --short
+
+                      # Check jq installed
+                      jq --version
+
+                      # Check helm installed
+                      helm version
+
+                      # Assume role in target AWS Lifecycle Account
+                      echo "[INFO] Delegate starting run in..."
+                      aws sts get-caller-identity
+
+                      export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" \
+                      $(aws sts assume-role \
+                      --role-arn arn:aws:iam::${LIFECYCLE_ID}:role/${ATM_ID}_Harness_Pipeline_Role \
+                      --role-session-name HarnessDeployRoleSession \
+                      --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]" \
+                      --output text))
+
+                      echo "[INFO] Runing assumed lifecycle role..."
+                      aws sts get-caller-identity
+
+                      # Get cluster name from parameter store
+                      aws ssm get-parameter --region $REGION --name "/mothership/cluster_info" --query "Parameter.Value" --output text > params.json
+                      cluster_name=$(jq -r '.cluster_name' ./params.json)
+
+                      echo "[INFO] Generating Kubeconfig file..."
+                      # Retrieve kubeconfig from SSM
+                      aws ssm get-parameter --region $REGION --name "/mothership/$cluster_name/kubeconfig" --query "Parameter.Value" --output text > kubeconfig
+                      chmod 600 kubeconfig
+
+                      # Set kubeconfig filepath
+                      export KUBECONFIG="$PWD/kubeconfig"
+
+                      # Check kubectl access
+                      echo "[INFO] Do I have access to create deployments?"
+                      kubectl auth can-i create deployments --namespace=$CLUSTER_NAMESPACE --kubeconfig="./kubeconfig"
+
+                      # Assert connection to namespace
+                      kubectl get pods -n $CLUSTER_NAMESPACE
+
+                      echo "[INFO] Logging into ECR for helm pull..."
+                      aws ecr get-login-password --region $REGION | helm registry login --username AWS --password-stdin $LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com
+
+                      echo "[INFO] Pulling helm chart from ECR..."
+                      helm pull oci://$LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com/$HELM_ECR_IMAGE_NAME --version ${TAG}
+
+                      echo "[DEBUG] ls -la"
+                      ls -la
+
+                      tar -xf "$HELM_ECR_IMAGE_NAME-$TAG.tgz"
+
+                      echo "[DEBUG] ls -la"
+                      ls -la
+
+                      echo "[INFO] Showing helm values..."
+                      cat ./$HELM_CHART_NAME/$VALUES_YAML
+                      echo "--------------------------------------------------------------------------------"
+
+                      echo "[INFO] Showing generated helm template..."
+                      echo "################################################################################"
+                      echo "# Generated Helm Template"
+                      echo "################################################################################"
+                      helm template $RELEASE_NAME $HELM_CHART_NAME --values ./$HELM_CHART_NAME/$VALUES_YAML
+                      echo "--------------------------------------------------------------------------------"
+
+                      # uninstall current helm deployment
+                      echo "[INFO] Uninstalling current version of helm release $RELEASE_NAME..."
+                      helm uninstall $RELEASE_NAME -n $CLUSTER_NAMESPACE --wait --timeout 60s || true
+
+                      if [ "$HELM_FORCE_VALUES_YAML" == "" ];
+                      then
+                        echo "[INFO] Creating new helm release with values file $VALUES_YAML..."
+                        helm upgrade --install $RELEASE_NAME ${HELM_CHART_NAME} --values ./$HELM_CHART_NAME/$VALUES_YAML -n $CLUSTER_NAMESPACE
+                      else
+                        echo "[INFO] Creating new helm release with force values file $$HELM_FORCE_VALUES_YAML..."
+                        cat $APP_NAME/$HELM_FORCE_VALUES_YAML
+                        ls -la
+                        helm upgrade --install $RELEASE_NAME $HELM_CHART_NAME --values ./$HELM_CHART_NAME/$VALUES_YAML -f ./$HELM_CHART_NAME/$HELM_FORCE_VALUES_YAML -n $CLUSTER_NAMESPACE
+                      fi
+                    shell: Bash
+                    infrastructure:
+                      type: KubernetesDirect
+                      spec:
+                        connectorRef: inavigateaa00002756_kubernetes_shared
+                        namespace: inavigateaa00002756-delegate-snp-qa
+                        resources:
+                          limits:
+                            cpu: "1"
+                            memory: 1G
+                        annotations: {}
+                        labels: {}
+                        containerSecurityContext:
+                          capabilities:
+                            drop: []
+                            add: []
+                        nodeSelector: {}
+                    reports:
+                      type: JUnit
+                      spec:
+                        paths: []
+                    outputVariables: []
+                    envVariables:
+                      TAG: <+pipeline.stages.Build.spec.execution.steps.Get_Version.output.outputVariables.semver>
+                      APP_NAME: <+pipeline.variables.app_name>
+                      ATM_ID: <+pipeline.variables.atm_id>
+                      CLUSTER_NAMESPACE: <+stage.variables.cluster_namespace>
+                      ENVIRONMENT: <+stage.variables.environment>
+                      HELM_FORCE_VALUES_YAML: <+stage.variables.helm_force_values_yaml>
+                      HELM_ECR_IMAGE_NAME: <+pipeline.variables.app_name>-<+stage.variables.environment><+stage.variables.sub_environment>-helm
+                      HELM_CHART_NAME: <+pipeline.variables.app_name>-helm
+                      LIFECYCLE_ID: <+stage.variables.lifecycle_id>
+                      REGION: <+pipeline.variables.region>
+                      RELEASE_NAME: <+pipeline.variables.release_name>
+                      SUB_ENVIRONMENT: <+stage.variables.sub_environment>
+                      VALUES_YAML: values-<+stage.variables.environment><+stage.variables.sub_environment>.yaml
+                  timeout: 1d
+              - step:
+                  type: Container
+                  name: Helm Upgrade DR
+                  identifier: HelmDR
+                  when:
+                    stageStatus: Success
+                    condition: <+stage.variables.dr_enabled>=="true"
+                  spec:
+                    connectorRef: account.acct_cgdevregistry_aws_nexus_publish
+                    image: harness/common/helm:1.0.3
+                    command: |-
+                      # Check kubectl installed
+                      kubectl version --short
+
+                      # Check jq installed
+                      jq --version
+
+                      # Check helm installed
+                      helm version
+
+                      # Assume role in target AWS Lifecycle Account
+                      echo "[INFO] Delegate starting run in..."
+                      aws sts get-caller-identity
+
+                      export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" \
+                      $(aws sts assume-role \
+                      --role-arn arn:aws:iam::${LIFECYCLE_ID}:role/${ATM_ID}_Harness_Pipeline_Role \
+                      --role-session-name HarnessDeployRoleSession \
+                      --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]" \
+                      --output text))
+
+                      echo "[INFO] Running assumed lifecycle role..."
+                      aws sts get-caller-identity
+
+                      # Get cluster name from parameter store
+                      aws ssm get-parameter --region $REGION --name "/mothership/cluster_info" --query "Parameter.Value" --output text > params.json
+                      cluster_name=$(jq -r '.cluster_name' ./params.json)
+
+                      echo "[INFO] Generating Kubeconfig file..."
+                      # Retrieve kubeconfig from SSM
+                      aws ssm get-parameter --region $REGION --name "/mothership/$cluster_name/kubeconfig" --query "Parameter.Value" --output text > kubeconfig
+                      chmod 600 kubeconfig
+
+                      # Set kubeconfig filepath
+                      export KUBECONFIG="$PWD/kubeconfig"
+
+                      # Check kubectl access
+                      echo "[INFO] Do I have access to create deployments?"
+                      kubectl auth can-i create deployments --namespace=$CLUSTER_NAMESPACE --kubeconfig="./kubeconfig"
+
+                      # Assert connection to namespace
+                      kubectl get pods -n $CLUSTER_NAMESPACE
+
+                      echo "[INFO] Logging into ECR for helm pull..."
+                      aws ecr get-login-password --region $REGION | helm registry login --username AWS --password-stdin $LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com
+
+                      echo "[INFO] Pulling helm chart from ECR..."
+                      helm pull oci://$LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com/$HELM_ECR_IMAGE_NAME --version ${TAG}
+
+                      echo "[DEBUG] ls -la"
+                      ls -la
+
+                      tar -xf "$HELM_ECR_IMAGE_NAME-$TAG.tgz"
+
+                      echo "[DEBUG] ls -la"
+                      ls -la
+
+                      echo "[INFO] Showing helm values..."
+                      cat ./$HELM_CHART_NAME/$VALUES_YAML
+                      echo "--------------------------------------------------------------------------------"
+
+                      echo "[INFO] Showing generated helm template..."
+                      echo "################################################################################"
+                      echo "# Generated Helm Template"
+                      echo "################################################################################"
+                      helm template $RELEASE_NAME $HELM_CHART_NAME --values ./$HELM_CHART_NAME/$VALUES_YAML
+                      echo "--------------------------------------------------------------------------------"
+
+                      # uninstall current helm deployment
+                      echo "[INFO] Uninstalling current version of helm release $RELEASE_NAME..."
+                      helm uninstall $RELEASE_NAME -n $CLUSTER_NAMESPACE --wait --timeout 60s || true
+
+                      if [ "$HELM_FORCE_VALUES_YAML" == "" ];
+                      then
+                        echo "[INFO] Creating new helm release with values file $VALUES_YAML..."
+                        helm upgrade --install $RELEASE_NAME $HELM_CHART_NAME --values ./$HELM_CHART_NAME/$VALUES_YAML -n $CLUSTER_NAMESPACE
+                      else
+                        echo "[INFO] Creating new helm release with force values file $$HELM_FORCE_VALUES_YAML..."
+                        cat $APP_NAME/$HELM_FORCE_VALUES_YAML
+                        ls -la
+                        helm upgrade --install $RELEASE_NAME $HELM_CHART_NAME --values ./$HELM_CHART_NAME/$VALUES_YAML -f ./$HELM_CHART_NAME/$HELM_FORCE_VALUES_YAML -n $CLUSTER_NAMESPACE
+                      fi
+                    shell: Bash
+                    infrastructure:
+                      type: KubernetesDirect
+                      spec:
+                        connectorRef: inavigateaa00002756_kubernetes_shared
+                        namespace: inavigateaa00002756-delegate-snp-qa
+                        resources:
+                          limits:
+                            cpu: "1"
+                            memory: 1G
+                        annotations: {}
+                        labels: {}
+                        containerSecurityContext:
+                          capabilities:
+                            drop: []
+                            add: []
+                        nodeSelector: {}
+                    reports:
+                      type: JUnit
+                      spec:
+                        paths: []
+                    outputVariables: []
+                    envVariables:
+                      TAG: <+pipeline.stages.Build.spec.execution.steps.Get_Version.output.outputVariables.semver>
+                      APP_NAME: <+pipeline.variables.app_name>
+                      ATM_ID: <+pipeline.variables.atm_id>
+                      CLUSTER_NAMESPACE: <+stage.variables.cluster_namespace>
+                      ENVIRONMENT: <+stage.variables.environment>
+                      HELM_FORCE_VALUES_YAML: <+stage.variables.helm_force_values_yaml>
+                      HELM_ECR_IMAGE_NAME: <+pipeline.variables.app_name>-<+stage.variables.environment><+stage.variables.sub_environment>-helm
+                      HELM_CHART_NAME: <+pipeline.variables.app_name>-helm
+                      LIFECYCLE_ID: <+stage.variables.lifecycle_id>
+                      REGION: <+pipeline.variables.region_dr>
+                      RELEASE_NAME: <+pipeline.variables.release_name>
+                      SUB_ENVIRONMENT: <+stage.variables.sub_environment>
+                      VALUES_YAML: values-<+stage.variables.environment><+stage.variables.sub_environment>-dr.yaml
+                  timeout: 1d
+        tags: {}
+        variables:
+          - name: lifecycle_id
+            type: String
+            description: ""
+            required: true
+            value: <+input>.default(597088058888)
+          - name: cluster_namespace
+            type: String
+            description: ""
+            required: true
+            value: <+input>.default(aa00002756-qa-inav-sqa1)
+          - name: helm_force_values_yaml
+            type: String
+            description: ""
+            required: false
+            value: <+input>.default()
+          - name: dr_enabled
+            type: String
+            description: Set to true to enable DR deployment
+            required: false
+            value: <+input>.default(true)
+          - name: environment
+            type: String
+            value: sqa
+          - name: sub_environment
+            type: String
+            value: <+input>.default(1)
+        delegateSelectors:
+          - inavigateaa00002756-delegate-snp-qa
+    - stage:
+        name: Servicenow Check
+        identifier: Servicenow_Check
+        tags: {}
+        template:
+          templateRef: account.cgservicenowapprovalcheckstagetemplate
+          versionLabel: v.01
+          gitBranch: main
+          templateInputs:
+            type: Approval
+            delegateSelectors:
+              - inavigateaa00002756-delegate-cpz-prod
+            variables:
+              - name: Change_Request_Number
+                type: String
+                value: <+input>.executionInput().default(change-request-goes-here)
+    - stage:
+        name: Deploy PRD
+        identifier: Deploy_PRD
+        description: ""
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Gauntlet
+                  identifier: Gauntlet
+                  template:
+                    templateRef: account.cggauntletscanstepcustomtemplate
+                    versionLabel: mcp-helm
+                    templateInputs:
+                      type: CustomApproval
+                      spec:
+                        environmentVariables:
+                          - name: ENV_GATE
+                            type: String
+                            value: CPZ-PRD
+              - step:
+                  name: Prod Image Promotion
+                  identifier: Prod_promotion
+                  template:
+                    templateRef: account.ProdContainerImagePromotion
+                    versionLabel: v0.1
+                    gitBranch: main
+                    templateInputs:
+                      type: Container
+                      spec:
+                        envVariables:
+                          COMMA_SEPARATED_IMAGE_NAMES_WITH_TAG: <+pipeline.variables.app_name>:<+pipeline.stages.Build.spec.execution.steps.Get_Version.output.outputVariables.semver>,<+pipeline.variables.app_name>-helm:<+pipeline.stages.Build.spec.execution.steps.Get_Version.output.outputVariables.semver>
+              - step:
+                  type: Container
+                  name: Promote to PRD
+                  identifier: Promote_to_PRD
+                  spec:
+                    connectorRef: account.acct_cgdevregistry_aws_nexus_publish
+                    image: harness/banzai/dockerfile_crane:1.0.6
+                    command: |
+                      set -x
+                      # Check Crane installed
+                      crane version
+
+                      # Auth into cgprdregistry-aws.capgroup.com
+
+                      crane auth login -u "<+secrets.getValue("account.acct_cgprdregistry_aws_nexus_username")>" -p "<+secrets.getValue("account.acct_cgprdregistry_aws_nexus_password")>" cgprdregistry-aws.capgroup.com
+
+                      # Assume role in target AWS Lifecycle Account
+                      echo "[INFO] Delegate starting run in..."
+                      aws sts get-caller-identity
+
+                      export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" \
+                      $(aws sts assume-role \
+                      --role-arn arn:aws:iam::${LIFECYCLE_ID}:role/${ATM_ID}_Harness_Pipeline_Role \
+                      --role-session-name HarnessDeployRoleSession \
+                      --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]" \
+                      --output text))
+
+                      echo "[INFO] Run assumed lifecycle role..."
+                      aws sts get-caller-identity
+
+                      # Auth with Crane to ECR
+                      password=$(aws ecr get-login-password --region $REGION)
+                      crane auth login -u AWS -p $password $LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com
+
+                      # copy images from nexus to ecr
+                      # if the version of Helm that is to be deployed was packaged with previous version on the app then we can ignore failure of this command.
+                      crane cp cgprdregistry-aws.capgroup.com/$PROJECT_ID/$APP_NAME:${TAG} $LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com/$APP_NAME-$ENVIRONMENT$SUB_ENVIRONMENT:${TAG}
+                      crane cp cgprdregistry-aws.capgroup.com/$PROJECT_ID/$HELM_CHART_NAME:${TAG} $LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com/$APP_NAME-$ENVIRONMENT$SUB_ENVIRONMENT-helm:${TAG}
+                    shell: Bash
+                    infrastructure:
+                      type: KubernetesDirect
+                      spec:
+                        connectorRef: inavigateaa00002756_kubernetes_shared
+                        namespace: inavigateaa00002756-delegate-cpz-prod
+                        resources:
+                          limits:
+                            cpu: "1"
+                            memory: 2G
+                        annotations: {}
+                        labels: {}
+                        containerSecurityContext:
+                          capabilities:
+                            drop: []
+                            add: []
+                        nodeSelector: {}
+                    reports:
+                      type: JUnit
+                      spec:
+                        paths: []
+                    outputVariables: []
+                    envVariables:
+                      TAG: <+pipeline.stages.Build.spec.execution.steps.Get_Version.output.outputVariables.semver>
+                      APP_NAME: <+pipeline.variables.app_name>
+                      HELM_CHART_NAME: <+pipeline.variables.app_name>-helm
+                      ATM_ID: <+pipeline.variables.atm_id>
+                      LIFECYCLE_ID: <+stage.variables.lifecycle_id>
+                      NEXUS_USERNAME: <+secrets.getValue("account.acct_cgprdregistry_aws_nexus_username"")>
+                      NEXUS_PASSWORD: <+secrets.getValue("account.acct_cgprdregistry_aws_nexus_password")>
+                      PROJECT_ID: <+project.identifier>
+                      REGION: <+pipeline.variables.region>
+                      ENVIRONMENT: <+stage.variables.environment>
+                      SUB_ENVIRONMENT: <+stage.variables.sub_environment>
+                  timeout: 1d
+              - step:
+                  type: Container
+                  name: Helm Upgrade
+                  identifier: Helm
+                  spec:
+                    connectorRef: account.acct_cgdevregistry_aws_nexus_publish
+                    image: harness/common/helm:1.0.3
+                    command: |-
+                      set -x
+                      # Check kubectl installed
+                      kubectl version --short
+
+                      # Check jq installed
+                      jq --version
+
+                      # Check helm installed
+                      helm version
+
+                      # Assume role in target AWS Lifecycle Account
+                      echo "[INFO] Delegate starting run in..."
+                      aws sts get-caller-identity
+
+                      export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" \
+                      $(aws sts assume-role \
+                      --role-arn arn:aws:iam::${LIFECYCLE_ID}:role/${ATM_ID}_Harness_Pipeline_Role \
+                      --role-session-name HarnessDeployRoleSession \
+                      --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]" \
+                      --output text))
+
+                      echo "[INFO] Runing assumed lifecycle role..."
+                      aws sts get-caller-identity
+
+                      # Get cluster name from parameter store
+                      aws ssm get-parameter --region $REGION --name "/mothership/cluster_info" --query "Parameter.Value" --output text > params.json
+                      cluster_name=$(jq -r '.cluster_name' ./params.json)
+
+                      echo "[INFO] Generating Kubeconfig file..."
+                      # Retrieve kubeconfig from SSM
+                      aws ssm get-parameter --region $REGION --name "/mothership/$cluster_name/kubeconfig" --query "Parameter.Value" --output text > kubeconfig
+                      chmod 600 kubeconfig
+
+                      # Set kubeconfig filepath
+                      export KUBECONFIG="$PWD/kubeconfig"
+
+                      # Check kubectl access
+                      echo "[INFO] Do I have access to create deployments?"
+                      kubectl auth can-i create deployments --namespace=$CLUSTER_NAMESPACE --kubeconfig="./kubeconfig"
+
+                      # Assert connection to namespace
+                      kubectl get pods -n $CLUSTER_NAMESPACE
+
+                      echo "[INFO] Logging into ECR for helm pull..."
+                      aws ecr get-login-password --region $REGION | helm registry login --username AWS --password-stdin $LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com
+
+                      echo "[INFO] Pulling helm chart from ECR..."
+                      helm pull oci://$LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com/$HELM_ECR_IMAGE_NAME --version ${TAG}
+
+                      echo "[DEBUG] ls -la"
+                      ls -la
+
+                      tar -xf "$HELM_ECR_IMAGE_NAME-$TAG.tgz"
+
+                      echo "[DEBUG] ls -la"
+                      ls -la
+
+                      echo "[INFO] Showing helm values..."
+                      cat ./$HELM_CHART_NAME/$VALUES_YAML
+                      echo "--------------------------------------------------------------------------------"
+
+                      echo "[INFO] Showing generated helm template..."
+                      echo "################################################################################"
+                      echo "# Generated Helm Template"
+                      echo "################################################################################"
+                      helm template $RELEASE_NAME $HELM_CHART_NAME --values ./$HELM_CHART_NAME/$VALUES_YAML
+                      echo "--------------------------------------------------------------------------------"
+
+                      # uninstall current helm deployment
+                      echo "[INFO] Uninstalling current version of helm release $RELEASE_NAME..."
+                      helm uninstall $RELEASE_NAME -n $CLUSTER_NAMESPACE --wait --timeout 60s || true
+
+                      if [ "$HELM_FORCE_VALUES_YAML" == "" ];
+                      then
+                        echo "[INFO] Creating new helm release with values file $VALUES_YAML..."
+                        helm upgrade --install $RELEASE_NAME ${HELM_CHART_NAME} --values ./$HELM_CHART_NAME/$VALUES_YAML -n $CLUSTER_NAMESPACE
+                      else
+                        echo "[INFO] Creating new helm release with force values file $$HELM_FORCE_VALUES_YAML..."
+                        cat $APP_NAME/$HELM_FORCE_VALUES_YAML
+                        ls -la
+                        helm upgrade --install $RELEASE_NAME $HELM_CHART_NAME --values ./$HELM_CHART_NAME/$VALUES_YAML -f ./$HELM_CHART_NAME/$HELM_FORCE_VALUES_YAML -n $CLUSTER_NAMESPACE
+                      fi
+                    shell: Bash
+                    infrastructure:
+                      type: KubernetesDirect
+                      spec:
+                        connectorRef: inavigateaa00002756_kubernetes_shared
+                        namespace: inavigateaa00002756-delegate-cpz-prod
+                        resources:
+                          limits:
+                            cpu: "1"
+                            memory: 1G
+                        annotations: {}
+                        labels: {}
+                        containerSecurityContext:
+                          capabilities:
+                            drop: []
+                            add: []
+                        nodeSelector: {}
+                    reports:
+                      type: JUnit
+                      spec:
+                        paths: []
+                    outputVariables: []
+                    envVariables:
+                      TAG: <+pipeline.stages.Build.spec.execution.steps.Get_Version.output.outputVariables.semver>
+                      APP_NAME: <+pipeline.variables.app_name>
+                      ATM_ID: <+pipeline.variables.atm_id>
+                      CLUSTER_NAMESPACE: <+stage.variables.cluster_namespace>
+                      ENVIRONMENT: <+stage.variables.environment>
+                      HELM_FORCE_VALUES_YAML: <+stage.variables.helm_force_values_yaml>
+                      HELM_ECR_IMAGE_NAME: <+pipeline.variables.app_name>-<+stage.variables.environment><+stage.variables.sub_environment>-helm
+                      HELM_CHART_NAME: <+pipeline.variables.app_name>-helm
+                      LIFECYCLE_ID: <+stage.variables.lifecycle_id>
+                      REGION: <+pipeline.variables.region>
+                      RELEASE_NAME: <+pipeline.variables.release_name>
+                      SUB_ENVIRONMENT: <+stage.variables.sub_environment>
+                      VALUES_YAML: values-<+stage.variables.environment><+stage.variables.sub_environment>.yaml
+                  timeout: 1d
+              - step:
+                  type: Container
+                  name: Helm Upgrade DR
+                  identifier: HelmDR
+                  when:
+                    stageStatus: Success
+                    condition: <+stage.variables.dr_enabled>=="true"
+                  spec:
+                    connectorRef: account.acct_cgdevregistry_aws_nexus_publish
+                    image: harness/common/helm:1.0.3
+                    command: |-
+                      # Check kubectl installed
+                      kubectl version --short
+
+                      # Check jq installed
+                      jq --version
+
+                      # Check helm installed
+                      helm version
+
+                      # Assume role in target AWS Lifecycle Account
+                      echo "[INFO] Delegate starting run in..."
+                      aws sts get-caller-identity
+
+                      export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" \
+                      $(aws sts assume-role \
+                      --role-arn arn:aws:iam::${LIFECYCLE_ID}:role/${ATM_ID}_Harness_Pipeline_Role \
+                      --role-session-name HarnessDeployRoleSession \
+                      --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]" \
+                      --output text))
+
+                      echo "[INFO] Running assumed lifecycle role..."
+                      aws sts get-caller-identity
+
+                      # Get cluster name from parameter store
+                      aws ssm get-parameter --region $REGION --name "/mothership/cluster_info" --query "Parameter.Value" --output text > params.json
+                      cluster_name=$(jq -r '.cluster_name' ./params.json)
+
+                      echo "[INFO] Generating Kubeconfig file..."
+                      # Retrieve kubeconfig from SSM
+                      aws ssm get-parameter --region $REGION --name "/mothership/$cluster_name/kubeconfig" --query "Parameter.Value" --output text > kubeconfig
+                      chmod 600 kubeconfig
+
+                      # Set kubeconfig filepath
+                      export KUBECONFIG="$PWD/kubeconfig"
+
+                      # Check kubectl access
+                      echo "[INFO] Do I have access to create deployments?"
+                      kubectl auth can-i create deployments --namespace=$CLUSTER_NAMESPACE --kubeconfig="./kubeconfig"
+
+                      # Assert connection to namespace
+                      kubectl get pods -n $CLUSTER_NAMESPACE
+
+                      echo "[INFO] Logging into ECR for helm pull..."
+                      aws ecr get-login-password --region $REGION | helm registry login --username AWS --password-stdin $LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com
+
+                      echo "[INFO] Pulling helm chart from ECR..."
+                      helm pull oci://$LIFECYCLE_ID.dkr.ecr.$REGION.amazonaws.com/$HELM_ECR_IMAGE_NAME --version ${TAG}
+
+                      echo "[DEBUG] ls -la"
+                      ls -la
+
+                      tar -xf "$HELM_ECR_IMAGE_NAME-$TAG.tgz"
+
+                      echo "[DEBUG] ls -la"
+                      ls -la
+
+                      echo "[INFO] Showing helm values..."
+                      cat ./$HELM_CHART_NAME/$VALUES_YAML
+                      echo "--------------------------------------------------------------------------------"
+
+                      echo "[INFO] Showing generated helm template..."
+                      echo "################################################################################"
+                      echo "# Generated Helm Template"
+                      echo "################################################################################"
+                      helm template $RELEASE_NAME $HELM_CHART_NAME --values ./$HELM_CHART_NAME/$VALUES_YAML
+                      echo "--------------------------------------------------------------------------------"
+
+                      # uninstall current helm deployment
+                      echo "[INFO] Uninstalling current version of helm release $RELEASE_NAME..."
+                      helm uninstall $RELEASE_NAME -n $CLUSTER_NAMESPACE --wait --timeout 60s || true
+
+                      if [ "$HELM_FORCE_VALUES_YAML" == "" ];
+                      then
+                        echo "[INFO] Creating new helm release with values file $VALUES_YAML..."
+                        helm upgrade --install $RELEASE_NAME $HELM_CHART_NAME --values ./$HELM_CHART_NAME/$VALUES_YAML -n $CLUSTER_NAMESPACE
+                      else
+                        echo "[INFO] Creating new helm release with force values file $$HELM_FORCE_VALUES_YAML..."
+                        cat $APP_NAME/$HELM_FORCE_VALUES_YAML
+                        ls -la
+                        helm upgrade --install $RELEASE_NAME $HELM_CHART_NAME --values ./$HELM_CHART_NAME/$VALUES_YAML -f ./$HELM_CHART_NAME/$HELM_FORCE_VALUES_YAML -n $CLUSTER_NAMESPACE
+                      fi
+                    shell: Bash
+                    infrastructure:
+                      type: KubernetesDirect
+                      spec:
+                        connectorRef: inavigateaa00002756_kubernetes_shared
+                        namespace: inavigateaa00002756-delegate-cpz-prod
+                        resources:
+                          limits:
+                            cpu: "1"
+                            memory: 1G
+                        annotations: {}
+                        labels: {}
+                        containerSecurityContext:
+                          capabilities:
+                            drop: []
+                            add: []
+                        nodeSelector: {}
+                    reports:
+                      type: JUnit
+                      spec:
+                        paths: []
+                    outputVariables: []
+                    envVariables:
+                      TAG: <+pipeline.stages.Build.spec.execution.steps.Get_Version.output.outputVariables.semver>
+                      APP_NAME: <+pipeline.variables.app_name>
+                      ATM_ID: <+pipeline.variables.atm_id>
+                      CLUSTER_NAMESPACE: <+stage.variables.cluster_namespace>
+                      ENVIRONMENT: <+stage.variables.environment>
+                      HELM_FORCE_VALUES_YAML: <+stage.variables.helm_force_values_yaml>
+                      HELM_ECR_IMAGE_NAME: <+pipeline.variables.app_name>-<+stage.variables.environment><+stage.variables.sub_environment>-helm
+                      HELM_CHART_NAME: <+pipeline.variables.app_name>-helm
+                      LIFECYCLE_ID: <+stage.variables.lifecycle_id>
+                      REGION: <+pipeline.variables.region_dr>
+                      RELEASE_NAME: <+pipeline.variables.release_name>
+                      SUB_ENVIRONMENT: <+stage.variables.sub_environment>
+                      VALUES_YAML: values-<+stage.variables.environment><+stage.variables.sub_environment>-dr.yaml
+                  timeout: 1d
+        tags: {}
+        variables:
+          - name: lifecycle_id
+            type: String
+            description: ""
+            required: true
+            value: <+input>.default(149536464613)
+          - name: cluster_namespace
+            type: String
+            description: ""
+            required: true
+            value: <+input>.default(aa00002756-prd-inav-prd1)
+          - name: helm_force_values_yaml
+            type: String
+            description: ""
+            required: false
+            value: <+input>.default()
+          - name: dr_enabled
+            type: String
+            description: Set to true to enable DR deployment
+            required: false
+            value: <+input>.default(true)
+          - name: environment
+            type: String
+            value: prd
+          - name: sub_environment
+            type: String
+            value: <+input>.default(1)
+        delegateSelectors:
+          - inavigateaa00002756-delegate-cpz-prod
+  flowControl:
+    barriers: []
+  variables:
+    - name: input_docker_image_version
+      type: String
+      description: A specific docker image version to deploy
+      required: false
+      value: <+input>.default()
+    - name: helm_chart_directory
+      type: String
+      description: ""
+      required: true
+      value: <+input>.default(helix/container/helm-chart)
+    - name: docker_build_directory
+      type: String
+      description: ""
+      required: true
+      value: <+input>.default(.)
+    - name: atm_id
+      type: String
+      description: ""
+      required: true
+      value: <+input>.default(AA00002756)
+    - name: region
+      type: String
+      description: ""
+      required: true
+      value: <+input>.default(us-east-1)
+    - name: region_dr
+      type: String
+      description: The AWS region where the DR environment is located
+      required: true
+      value: <+input>.default(us-west-2)
+    - name: app_name
+      type: String
+      description: ""
+      required: true
+      value: <+input>.default(rtm)
+    - name: app_image_name
+      type: String
+      description: Copy of app name needed by prod gauntlet step
+      required: true
+      value: <+pipeline.variables.app_name>
+    - name: release_name
+      type: String
+      description: ""
+      required: true
+      value: <+input>.default(<+pipeline.variables.app_name>+"-release")
+    - name: build_number
+      type: String
+      description: This is the Patch Version added to the Major Minor found in Chart.yaml
+      required: false
+      value: <+input>.default(<+pipeline.sequenceId>)
+    - name: enable_gauntlet_scans
+      type: String
+      description: Enable gauntlet scans in all stages
+      required: false
+      value: <+input>.default(true)
+  allowStageExecutions: true
