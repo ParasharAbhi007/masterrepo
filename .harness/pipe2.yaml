@@ -1,0 +1,111 @@
+pipeline:
+  name: pipe2
+  identifier: pipe2
+  tags: {}
+  template:
+    templateRef: account.Pipeline_Template_K8S_Deployment_NonProd_COTS
+    versionLabel: V1.7.3-multi-test
+    templateInputs:
+      stages:
+        - stage:
+            identifier: fdff
+            template:
+              templateInputs:
+                type: Deployment
+                variables:
+                  - name: HELM_CHART_VERSION
+                    type: String
+                    value: <+input>
+                  - name: HELM_CONNECTOR
+                    type: String
+                    value: <+input>
+                  - name: TARGET_ENV
+                    type: String
+                    value: <+input>
+                  - name: GITHUB_CONNECTOR
+                    type: String
+                    value: <+input>
+                  - name: CLUSTER_CONNECTOR
+                    type: String
+                    value: <+input>
+                  - name: K8S_NAMESPACE
+                    type: String
+                    value: <+input>
+                  - name: RELEASE_NAME
+                    type: String
+                    value: <+input>
+      variables:
+        - name: COMMIT_SHA
+          type: String
+          value: <+input>.default(dskndk).allowedValues(dskndk,dfkndf,ghgh)
+        - name: DEPLOYMENT_PLATFORM
+          type: String
+          value: <+input>.allowedValues(aks,eks)
+        - name: GITHUB_REPO
+          type: String
+          value: <+input>.default(fxfcg)
+        - name: TVT_URL
+          type: String
+          value: <+input>
+        - name: CANARY_FLAG
+          type: String
+          value: "false"
+        - name: PUBLISH_API_ARTIFACTS
+          type: String
+          value: "false"
+        - name: KONG_ENV
+          type: String
+          default: NA
+          value: NA
+        - name: PERFORM_TESTING_FLAG
+          type: String
+          value: "false"
+        - name: KONG_SERVICE
+          type: String
+          value: ""
+        - name: APPLICATION_ID
+          type: String
+          value: ""
+        - name: KONG_PLATFORM
+          type: String
+          value: <+input>.default(aws).allowedValues(aws,azure)
+        - name: DELETE_RELEASE
+          type: String
+          value: "false"
+        - name: HELM_CHART_NAME
+          type: String
+          value: ""
+        - name: CLUSTER_NAME
+          type: String
+          default: default
+          value: default
+        - name: JOB_EXISTS_FLAG
+          type: String
+          value: <+input>.allowedValues(true,false)
+        - name: RUN_MODE
+          type: String
+          value: ""
+        - name: PORTS
+          type: String
+          default: NA
+          value: NA
+        - name: PROTOCOLS
+          type: String
+          default: NA
+          value: NA
+        - name: INGRESS_TYPES
+          type: String
+          default: NA
+          value: NA
+        - name: PERFORM_TVT_FLAG
+          type: String
+          default: "true"
+          value: "true"
+        - name: NUMBER_SERVICES
+          type: String
+          value: "1"
+        - name: jnjfvgfn
+          type: String
+          value: <+input>.default(b j).allowedValues(b j,m jn)
+  projectIdentifier: CSETest1
+  orgIdentifier: AbhiOrg
